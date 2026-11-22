@@ -1,0 +1,65 @@
+# uncensored config: ~/.config/uncensored/config. It's bash, read each time uncensored starts.
+#
+# Out of the box omp can reach the model's server and nothing else: no tools, no extensions,
+# no MCP servers, none of your omp settings, no other network, no DNS, your home hidden and
+# the filesystem read-only. Each setting below opens one hole. Open them one at a time, and
+# run `uncensored --dry-run` to see what's open before you chat.
+
+# ---- holes (all closed) ----------------------------------------------------------------
+
+# omp's built-in tools the model may use, comma-separated, e.g. "read,grep".
+# They act inside the jail, so they only see what READ_DIRS and WRITE_DIRS let in.
+# `omp --help` lists the tools.
+TOOLS=""
+
+# Other servers the jail may connect to, space-separated host:port, e.g. "localhost:8888".
+# "all" turns the network jail off. On Linux, use host names or localhost, and ports from 1024
+# up. On macOS a remote host opens its port to every host (sandbox-exec can't name hosts).
+ALLOW_NET=""
+
+# Your folders the jail may see, space-separated (no spaces in the names).
+READ_DIRS=""     # read-only
+WRITE_DIRS=""    # read-write
+
+# The folder omp starts in, which it may read. Empty: an empty throwaway folder.
+# omp also loads that folder's project config (.mcp.json, .omp/, AGENTS.md), so this can
+# bring in MCP servers.
+START_DIR=""
+
+# An mcp.json for omp (same format as ~/.omp/agent/mcp.json). Its servers run inside the jail,
+# so they also need READ_DIRS for their programs and ALLOW_NET for anything they call.
+MCP_CONFIG=""
+
+# Save chats in ~/.local/state/uncensored/sessions. "no": nothing is saved.
+SAVE_SESSIONS=yes
+
+# Anything else for omp, e.g. "--thinking high".
+OMP_FLAGS=""
+
+# The omp binary, if `command -v omp` finds a wrapper script instead.
+OMP_BIN=""
+
+# ---- models ----------------------------------------------------------------------------
+#
+#   model "<label>" url=<base URL> id=<model id> [setting=value ...]
+#
+#   url, id       the server's OpenAI-style base URL, and the model name it expects
+#   key           API key, or "!command" that prints it (runs outside the jail). Default: none
+#   context       context window in tokens. Default 32768
+#   max_tokens    longest reply in tokens. Default half the context, at most 16384
+#   api           omp's API type. Default openai-completions
+#   reasoning     yes or no: does it think before answering. Default yes
+#   before        a command to run first, outside the jail (say, load this model). If it fails,
+#                 omp doesn't start
+#   after         a command to run after omp exits, outside the jail (say, load the usual one)
+
+# llama-server, llama-swap, LM Studio, vLLM and the like:
+model "gpt-oss 20B abliterated" url=http://127.0.0.1:8080/v1 id=gpt-oss-20b-abliterated context=131072
+
+# Ollama's OpenAI-style endpoint:
+# model "Qwen3 abliterated (Ollama)" url=http://127.0.0.1:11434/v1 id=your-abliterated-model:latest
+
+# A server that holds one model at a time, with a key in a file:
+# model "Qwen 27B abliterated" url=http://127.0.0.1:8080/v1 id=qwen-27b-abliterated \
+#   key='!cat ~/.config/llama/api-key' context=131072 \
+#   before='switch-model qwen-27b-abliterated' after='switch-model default'

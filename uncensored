@@ -1,0 +1,461 @@
+#!/usr/bin/env bash
+# uncensored: chat with an uncensored model in omp (oh-my-pi), jailed.
+#
+#   uncensored                  pick a model from your config (fzf if you have it)
+#   uncensored <text>           the first model whose label contains <text>
+#   uncensored --list           print your models and exit
+#   uncensored --dry-run [...]  print what would run, and which holes are open, and exit
+#   uncensored --check [...]    test the jail; with a model, also that its server is reachable
+#
+# Closed by default: omp gets no tools, no extensions, no MCP servers and none of your omp
+# settings, and it can reach nothing but the model's server. No other network, no DNS, your
+# home hidden, the filesystem read-only except a throwaway home. Linux uses bubblewrap and
+# socat, macOS uses sandbox-exec. Every hole has a setting in the config; see config.example.
+# Works with bash 3.2 (macOS's /bin/bash).
+set -uo pipefail
+
+CONFIG=${UNCENSORED_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/uncensored/config}
+STATE=${UNCENSORED_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/uncensored}
+CACHE=${UNCENSORED_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/uncensored}
+OS=$(uname -s)
+log() { echo "[$(date +%T)] uncensored: $*" >&2; }
+die() { log "$*"; exit 1; }
+
+mode=run pick=""
+for a in "$@"; do
+  case $a in
+    --dry-run) mode=dry ;;
+    --list) mode=list ;;
+    --check) mode=check ;;
+    -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) die "unknown option $a (try --help)" ;;
+    *) pick=$a ;;
+  esac
+done
+
+# ---- config ------------------------------------------------------------------------------
+# The holes, all closed. The config file is bash and can open them; config.example says how.
+TOOLS="" ALLOW_NET="" READ_DIRS="" WRITE_DIRS="" START_DIR="" MCP_CONFIG="" SAVE_SESSIONS=yes
+OMP_FLAGS="" OMP_BIN=""
+n=0
+model() {  # model "<label>" url=... id=... [key=...] [context=...] [max_tokens=...] [api=...] [reasoning=yes|no] [before=...] [after=...]
+  local label=${1:-} a url="" id="" key="" ctx=32768 maxt="" api=openai-completions reasoning=yes before="" after=""
+  [[ -n $label ]] || die "$CONFIG: model needs a label first"
+  shift
+  for a in "$@"; do
+    case $a in
+      url=*) url=${a#url=} ;;
+      id=*) id=${a#id=} ;;
+      key=*) key=${a#key=} ;;
+      context=*) ctx=${a#context=} ;;
+      max_tokens=*) maxt=${a#max_tokens=} ;;
+      api=*) api=${a#api=} ;;
+      reasoning=*) reasoning=${a#reasoning=} ;;
+      before=*) before=${a#before=} ;;
+      after=*) after=${a#after=} ;;
+      *) die "$CONFIG: model \"$label\": unknown setting '$a'" ;;
+    esac
+  done
+  [[ -n $url && -n $id ]] || die "$CONFIG: model \"$label\" needs url= and id="
+  [[ $url == http://* || $url == https://* ]] || die "$CONFIG: model \"$label\": url must start with http:// or https://"
+  [[ $ctx =~ ^[0-9]+$ ]] || die "$CONFIG: model \"$label\": context must be a number"
+  [[ -n $maxt ]] || maxt=$(( ctx / 2 < 16384 ? ctx / 2 : 16384 ))
+  M_LABEL[n]=$label M_URL[n]=$url M_ID[n]=$id M_KEY[n]=$key M_CTX[n]=$ctx M_MAXT[n]=$maxt
+  M_API[n]=$api M_REASON[n]=$reasoning M_BEFORE[n]=$before M_AFTER[n]=$after
+  n=$((n + 1))
+}
+if [[ -r $CONFIG ]]; then
+  # shellcheck source=/dev/null
+  . "$CONFIG" || die "$CONFIG failed to load"
+elif [[ $mode != check ]]; then
+  die "no config at $CONFIG; run install.sh or copy config.example there"
+fi
+
+if [[ $mode == list ]]; then
+  (( n )) || die "$CONFIG lists no models"
+  i=0; while (( i < n )); do echo "${M_LABEL[i]}  (${M_URL[i]}, ${M_ID[i]})"; i=$((i + 1)); done
+  exit 0
+fi
+
+# ---- pick a model ------------------------------------------------------------------------
+sel=-1
+if [[ -n $pick ]]; then
+  lp=$(printf '%s' "$pick" | tr '[:upper:]' '[:lower:]')
+  i=0
+  while (( i < n )); do
+    case $(printf '%s' "${M_LABEL[i]}" | tr '[:upper:]' '[:lower:]') in *"$lp"*) sel=$i; break ;; esac
+    i=$((i + 1))
+  done
+  (( sel >= 0 )) || die "nothing matches '$pick'; uncensored --list shows the choices"
+elif [[ $mode != check ]]; then
+  (( n )) || die "$CONFIG lists no models"
+  if (( n == 1 )); then
+    sel=0
+  elif command -v fzf >/dev/null && [[ -t 0 && -t 1 ]]; then
+    choice=$(i=0; while (( i < n )); do printf '%s\t%s\n' "$i" "${M_LABEL[i]}"; i=$((i + 1)); done |
+             fzf --prompt 'uncensored> ' --height 40% --reverse --delimiter $'\t' --with-nth 2 \
+                 --header 'enter: chat, jailed   esc: quit') || exit 0
+    sel=${choice%%$'\t'*}
+  else
+    PS3="model: "
+    select label in "${M_LABEL[@]}"; do [[ -n $label ]] && { sel=$((REPLY - 1)); break; }; done
+  fi
+fi
+
+# ---- endpoints: the model's server plus ALLOW_NET ----------------------------------------
+is_loopback() { case $1 in localhost|127.*|::1) return 0 ;; esac; return 1; }
+is_ip() { [[ $1 =~ ^[0-9.]+$ || $1 == *:* ]]; }
+split_hostport() {  # host:port or [v6]:port -> HP_HOST HP_PORT
+  local hp=$1
+  if [[ $hp == \[* ]]; then HP_HOST=${hp%%]*}; HP_HOST=${HP_HOST#[}; HP_PORT=${hp##*]}; HP_PORT=${HP_PORT#:}
+  else HP_HOST=${hp%:*}; HP_PORT=${hp##*:}; [[ $hp == *:* ]] || HP_PORT=""; fi
+}
+E_HOST=() E_PORT=() E_IN=() E_INPORT=()
+add_endpoint() {  # host port -> E_*: where it is, and the address and port its relay listens on in the Linux jail
+  local k=${#E_HOST[@]}
+  E_HOST[k]=$1 E_PORT[k]=$2 E_INPORT[k]=$2
+  if is_loopback "$1"; then E_IN[k]=127.0.0.1; else E_IN[k]=127.0.0.$((10 + k)); fi
+  # the jail can't listen below 1024, so a relay for port 443 listens on 10443
+  (( $2 < 1024 )) && E_INPORT[k]=$(( $2 + 10000 ))
+  return 0
+}
+url_inside="" model_ep=-1
+if (( sel >= 0 )); then
+  url=${M_URL[sel]}; scheme=${url%%://*}; rest=${url#*://}; hostport=${rest%%/*}
+  path=""; [[ $rest == */* ]] && path=/${rest#*/}
+  split_hostport "$hostport"
+  [[ -n $HP_PORT ]] || { [[ $scheme == https ]] && HP_PORT=443 || HP_PORT=80; }
+  [[ $HP_PORT =~ ^[0-9]+$ ]] || die "model \"${M_LABEL[sel]}\": can't read the port in $url"
+  add_endpoint "$HP_HOST" "$HP_PORT"; model_ep=0
+  url_inside=$url
+  # Inside the Linux jail the URL points at the relay: a loopback host or an IP becomes the
+  # relay's address, a host name stays (the jail's /etc/hosts points it at the relay, so TLS
+  # still checks the right name), and a port under 1024 becomes the relay's port.
+  if [[ $OS == Linux && $ALLOW_NET != all ]]; then
+    h=$HP_HOST
+    if is_loopback "$HP_HOST" || is_ip "$HP_HOST"; then
+      [[ $scheme == http ]] || is_loopback "$HP_HOST" || die "model \"${M_LABEL[sel]}\": an https URL needs a host name, not an IP, inside the jail"
+      h=${E_IN[0]}
+    fi
+    url_inside="$scheme://$h:${E_INPORT[0]}$path"
+  elif [[ $OS == Darwin && $HP_HOST == localhost ]]; then
+    # looking up "localhost" can go through the system resolver, which the jail blocks
+    url_inside="$scheme://127.0.0.1:$HP_PORT$path"
+  fi
+fi
+if [[ $ALLOW_NET != all ]]; then
+  for hp in $ALLOW_NET; do
+    split_hostport "$hp"
+    [[ -n $HP_HOST && $HP_PORT =~ ^[0-9]+$ ]] || die "ALLOW_NET: '$hp' is not host:port"
+    if [[ $OS == Linux ]] && is_ip "$HP_HOST" && ! is_loopback "$HP_HOST"; then
+      die "ALLOW_NET: use a host name for '$hp' (an IP other than localhost can't be routed into the jail)"
+    fi
+    if [[ $OS == Linux ]] && (( HP_PORT < 1024 )); then
+      die "ALLOW_NET: '$hp': ports under 1024 can't be opened into the Linux jail yet (ALLOW_NET=all turns the network jail off)"
+    fi
+    add_endpoint "$HP_HOST" "$HP_PORT"
+  done
+fi
+
+# ---- omp ---------------------------------------------------------------------------------
+resolve() { local p=$1; readlink -f "$p" 2>/dev/null || printf '%s\n' "$p"; }
+omp_bin=${OMP_BIN:-$(command -v omp || true)}
+[[ -n $omp_bin ]] || die "omp is not on PATH (or set OMP_BIN in the config)"
+omp_bin=$(resolve "$omp_bin")
+if [[ $(head -c2 "$omp_bin" 2>/dev/null) == '#!' ]]; then
+  # a version manager's shim; the jail needs the real binary
+  real=$(mise which omp 2>/dev/null || true)
+  [[ -n $real ]] || die "$omp_bin is a script, not the omp binary; set OMP_BIN in the config"
+  omp_bin=$(resolve "$real")
+fi
+omp_dir=$(dirname "$omp_bin")
+omp_ver=$("$omp_bin" --version 2>/dev/null | sed -n 's|^omp/||p' | head -1)
+# omp unpacks native libraries per version. Your normal omp's copy is used read-only when it
+# has this version; otherwise uncensored keeps its own copy (about 140 MB) in $CACHE.
+if [[ -n $omp_ver && -d $HOME/.omp/natives/$omp_ver ]]; then natives=$HOME/.omp/natives natives_rw=""
+else natives=$CACHE/natives natives_rw=1; fi
+
+tools_flag=(--no-tools); [[ -n $TOOLS ]] && tools_flag=("--tools=$TOOLS")
+omp_args=()
+if (( sel >= 0 )); then
+  omp_args=(--model "uncensored/${M_ID[sel]}" "${tools_flag[@]}" --no-extensions --offline)
+  if [[ $SAVE_SESSIONS == yes ]]; then omp_args+=(--session-dir "$STATE/sessions"); else omp_args+=(--no-session); fi
+  # shellcheck disable=SC2206
+  [[ -n $OMP_FLAGS ]] && omp_args+=($OMP_FLAGS)
+  # Test hook: UNCENSORED_PRINT="question" sends one message in print mode instead of opening the chat
+  [[ -n ${UNCENSORED_PRINT:-} ]] && omp_args+=(-p "$UNCENSORED_PRINT")
+fi
+
+dirs_of() { local d; for d in $1; do [[ -d $d ]] || die "$2: $d is not a folder"; resolve "$d"; done; }
+read_dirs=$(dirs_of "$READ_DIRS" READ_DIRS) || exit 1
+write_dirs=$(dirs_of "$WRITE_DIRS" WRITE_DIRS) || exit 1
+start_dir=""; [[ -n $START_DIR ]] && { start_dir=$(dirs_of "$START_DIR" START_DIR) || exit 1; }
+[[ -z $MCP_CONFIG || -r $MCP_CONFIG ]] || die "MCP_CONFIG: can't read $MCP_CONFIG"
+
+if [[ $OS == Linux ]]; then
+  command -v bwrap >/dev/null || die "bubblewrap (bwrap) is missing; install.sh says how to get it"
+  command -v socat >/dev/null || [[ $ALLOW_NET == all ]] || die "socat is missing; install.sh says how to get it"
+elif [[ $OS == Darwin ]]; then
+  [[ -x /usr/bin/sandbox-exec ]] || die "/usr/bin/sandbox-exec is missing"
+else
+  die "only Linux and macOS are supported (this is $OS)"
+fi
+
+holes() {  # what the jail lets through, one line per hole
+  local i net="" rd wr
+  if [[ $ALLOW_NET == all ]]; then net="EVERYTHING (network jail off)"
+  else
+    i=0; while (( i < ${#E_HOST[@]} )); do net="$net${E_HOST[i]}:${E_PORT[i]} "; i=$((i + 1)); done
+    net=${net:-nothing}
+  fi
+  rd=$(echo $read_dirs $start_dir); wr=$(echo $write_dirs)
+  echo "tools:      ${TOOLS:-none}"
+  echo "network:    $net"
+  echo "can read:   ${rd:-nothing of yours}"
+  echo "can write:  ${wr:-nothing of yours}$( [[ $SAVE_SESSIONS == yes ]] && echo " (chats are saved in $STATE/sessions)")"
+  echo "starts in:  ${start_dir:-an empty folder}"
+  echo "MCP:        ${MCP_CONFIG:-none}"
+  [[ -n $OMP_FLAGS ]] && echo "omp flags:  $OMP_FLAGS"
+  return 0
+}
+
+if [[ $mode == dry ]]; then
+  if (( sel >= 0 )); then
+    echo "model:      ${M_LABEL[sel]} (${M_ID[sel]} at ${M_URL[sel]})"
+    [[ -n ${M_BEFORE[sel]} ]] && echo "first:      ${M_BEFORE[sel]}"
+  fi
+  echo "jail:       $( [[ $OS == Linux ]] && echo bubblewrap || echo sandbox-exec ), omp $omp_ver at $omp_bin"
+  holes
+  (( sel >= 0 )) && echo "omp:        omp ${omp_args[*]}"
+  (( sel >= 0 )) && [[ -n ${M_AFTER[sel]} ]] && echo "after:      ${M_AFTER[sel]}"
+  exit 0
+fi
+
+# ---- the throwaway home ------------------------------------------------------------------
+tmp="" relay_pids=""
+after_cmd=""; (( sel >= 0 )) && [[ $mode == run ]] && after_cmd=${M_AFTER[sel]}
+cleanup() {
+  local p
+  for p in $relay_pids; do pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; done   # socat forks per connection
+  [[ -n $tmp && -d $tmp ]] && rm -rf -- "$tmp"
+  if [[ -n $after_cmd ]]; then
+    log "running: $after_cmd"
+    bash -c "$after_cmd" || log "FAILED (exit $?): $after_cmd"
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+trap 'exit 129' HUP   # the terminal closed
+
+if (( sel >= 0 )) && [[ $mode == run && -n ${M_BEFORE[sel]} ]]; then
+  log "running: ${M_BEFORE[sel]}"
+  bash -c "${M_BEFORE[sel]}" || { rc=$?; log "FAILED (exit $rc): ${M_BEFORE[sel]}; not starting omp"; exit "$rc"; }
+fi
+key=""
+if (( sel >= 0 )) && [[ $mode == run ]]; then
+  key=${M_KEY[sel]}
+  if [[ $key == '!'* ]]; then   # a command that prints the key; it runs here, outside the jail
+    key=$(bash -c "${key#!}") || die "the key command for \"${M_LABEL[sel]}\" failed"
+  fi
+fi
+
+# A short private folder: $XDG_RUNTIME_DIR on Linux (only you can enter it); /tmp on macOS,
+# where $TMPDIR is too long for omp's sockets. Not under your home either way, since omp also
+# reads project config from the folders above the one it starts in.
+if [[ $OS == Linux ]]; then base=${XDG_RUNTIME_DIR:-/tmp}; else base=/tmp; fi
+tmp=$(mktemp -d "$base/uncensored.XXXXXX") || die "FAILED: mktemp in $base"
+tmp=$(cd "$tmp" && pwd -P)
+mkdir -p "$tmp/home/.omp/agent" "$tmp/cwd" "$tmp/relay"
+[[ $SAVE_SESSIONS == yes ]] && mkdir -p "$STATE/sessions"
+[[ -n $natives_rw ]] && mkdir -p "$natives"
+# autoQA denied, or omp adds a report_issue tool; setupVersion and the changelog marker skip
+# the sign-in wizard and changelog a fresh home would get every time
+printf 'setupVersion: 3\ndev:\n  autoqaConsent: denied\n' > "$tmp/home/.omp/agent/config.yml"
+[[ -n $omp_ver ]] && printf '%s' "$omp_ver" > "$tmp/home/.omp/agent/last-changelog-version"
+[[ -n $MCP_CONFIG ]] && install -m600 "$MCP_CONFIG" "$tmp/home/.omp/agent/mcp.json"
+yq() { local s=${1//\\/\\\\}; s=${s//\"/\\\"}; printf '"%s"' "$s"; }   # a YAML double-quoted string
+if (( sel >= 0 )); then
+  umask 077
+  {
+    echo "providers:"
+    echo "  uncensored:"
+    echo "    baseUrl: $(yq "$url_inside")"
+    echo "    api: $(yq "${M_API[sel]}")"
+    if [[ -n $key ]]; then echo "    apiKey: $(yq "$key")"; else echo "    auth: none"; fi
+    echo "    models:"
+    echo "      - id: $(yq "${M_ID[sel]}")"
+    echo "        name: $(yq "${M_LABEL[sel]}")"
+    echo "        reasoning: $( [[ ${M_REASON[sel]} == no ]] && echo false || echo true )"
+    echo "        input: [text]"
+    echo "        contextWindow: ${M_CTX[sel]}"
+    echo "        maxTokens: ${M_MAXT[sel]}"
+  } > "$tmp/home/.omp/agent/models.yml"
+  umask 022
+fi
+cwd=${start_dir:-$tmp/cwd}
+
+# What runs inside: omp, or for --check a probe of the jail
+probe() {
+  cat <<'EOF'
+#!/bin/bash
+# uncensored --check: runs inside the jail
+real_home=$1 sample=$2 model_in=$3 model_port=$4 bad=0
+pass() { echo "PASS  $*"; }
+fail() { echo "FAIL  $*"; bad=1; }
+tcp() { (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null; }
+tcp 1.1.1.1 443 && fail "reached 1.1.1.1:443" || pass "no internet (1.1.1.1:443 unreachable)"
+tcp example.com 80 && fail "looked up and reached example.com" || pass "no DNS (example.com unreachable)"
+if [[ -n $sample ]]; then
+  # macOS hides contents, not whether a path exists, so this lists the home folder
+  ls -A "$real_home" 2>/dev/null | grep -qxF "$sample" && fail "can list $real_home and see $sample" ||
+    pass "home hidden (listing $real_home doesn't show $sample)"
+fi
+f=$real_home/.uncensored-check-$$
+if touch "$f" 2>/dev/null; then rm -f "$f"; fail "can write to $real_home"; else pass "can't write to $real_home"; fi
+if touch /usr/.uncensored-check-$$ 2>/dev/null; then rm -f /usr/.uncensored-check-$$; fail "can write to /usr"; else pass "can't write to /usr"; fi
+touch "$HOME/ok" 2>/dev/null && pass "throwaway home is writable" || fail "throwaway home is not writable"
+if [[ -n $model_port ]]; then
+  tcp "$model_in" "$model_port" && pass "model server reachable ($model_in:$model_port)" || fail "model server NOT reachable ($model_in:$model_port)"
+fi
+exit $bad
+EOF
+}
+
+if [[ $OS == Linux ]]; then
+  # ---- Linux: bubblewrap, no network namespace access except socat relays ---------------
+  inside=$tmp/inside.sh
+  {
+    echo '#!/bin/bash'
+    if [[ $ALLOW_NET != all ]]; then
+      i=0
+      while (( i < ${#E_HOST[@]} )); do
+        printf 'socat TCP-LISTEN:%s,bind=%s,fork,reuseaddr UNIX-CONNECT:%q 2>/dev/null &\n' "${E_INPORT[i]}" "${E_IN[i]}" "$tmp/relay/$i.sock"
+        hex=$(printf '%02X%02X%02X%02X:%04X' $(echo "${E_IN[i]}" | awk -F. '{print $4, $3, $2, $1}') "${E_INPORT[i]}")
+        # wait until the listener is up (LISTEN in /proc/net/tcp) so omp's first request finds it
+        printf 'for _ in $(seq 1 50); do grep -q " %s 00000000:0000 0A " /proc/net/tcp && break; sleep 0.05; done\n' "$hex"
+        i=$((i + 1))
+      done
+    fi
+    echo 'exec "$@"'
+  } > "$inside"
+  {
+    echo "127.0.0.1 localhost"
+    i=0
+    while (( i < ${#E_HOST[@]} )); do
+      is_loopback "${E_HOST[i]}" || is_ip "${E_HOST[i]}" || echo "${E_IN[i]} ${E_HOST[i]}"
+      i=$((i + 1))
+    done
+  } > "$tmp/hosts"
+  if [[ $ALLOW_NET != all ]]; then
+    i=0
+    while (( i < ${#E_HOST[@]} )); do
+      socat "UNIX-LISTEN:$tmp/relay/$i.sock,fork,mode=600" "TCP:${E_HOST[i]}:${E_PORT[i]}" 2>/dev/null &
+      relay_pids="$relay_pids $!"
+      i=$((i + 1))
+    done
+    i=0
+    while (( i < ${#E_HOST[@]} )); do
+      for _ in $(seq 1 50); do [[ -S $tmp/relay/$i.sock ]] && break; sleep 0.05; done
+      [[ -S $tmp/relay/$i.sock ]] || die "FAILED: relay to ${E_HOST[i]}:${E_PORT[i]} did not start"
+      i=$((i + 1))
+    done
+  fi
+  bw=(--unshare-all --die-with-parent --clearenv
+      --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --tmpfs /run --tmpfs /home)
+  [[ $HOME == /home/* ]] || bw+=(--tmpfs "$HOME")
+  if [[ $ALLOW_NET == all ]]; then
+    bw+=(--share-net --ro-bind-try /run/systemd/resolve /run/systemd/resolve)
+  else
+    bw+=(--ro-bind "$tmp/hosts" /etc/hosts)
+  fi
+  bw+=(--ro-bind "$omp_dir" "$omp_dir")
+  if [[ -n $natives_rw ]]; then bw+=(--bind "$natives" "$natives"); else bw+=(--ro-bind "$natives" "$natives"); fi
+  bw+=(--bind "$tmp" "$tmp")
+  [[ $SAVE_SESSIONS == yes ]] && bw+=(--bind "$STATE/sessions" "$STATE/sessions")
+  for d in $read_dirs $start_dir; do bw+=(--ro-bind "$d" "$d"); done
+  for d in $write_dirs; do bw+=(--bind "$d" "$d"); done
+  # the empty stand-ins for /home (and your home) go read-only once everything is mounted
+  bw+=(--remount-ro /home); [[ $HOME == /home/* ]] || bw+=(--remount-ro "$HOME")
+  bw+=(--setenv HOME "$tmp/home" --setenv PATH "/usr/local/bin:/usr/bin:/bin"
+       --setenv XDG_CONFIG_HOME "$tmp/home/.config" --setenv XDG_DATA_HOME "$tmp/home/.local/share"
+       --setenv XDG_CACHE_HOME "$tmp/home/.cache" --setenv XDG_STATE_HOME "$tmp/home/.local/state"
+       --setenv PI_NATIVES_DIR "$natives" --setenv USER "${USER:-$(id -un)}")
+  for v in TERM COLORTERM TERM_PROGRAM LANG LC_ALL LC_CTYPE TZ; do
+    [[ -n ${!v:-} ]] && bw+=(--setenv "$v" "${!v}")
+  done
+  bw+=(--chdir "$cwd")
+  jail() { bwrap "${bw[@]}" -- /bin/bash "$inside" "$@"; }
+else
+  # ---- macOS: sandbox-exec ---------------------------------------------------------------
+  sq() { local s=${1//\\/\\\\}; printf '"%s"' "${s//\"/\\\"}"; }   # an SBPL string
+  {
+    echo '(version 1)'
+    echo '(allow default)'
+    if [[ $ALLOW_NET != all ]]; then
+      echo '(deny network*)'
+      echo "(allow network* (local unix-socket (subpath $(sq "$tmp"))))"
+      echo "(allow network* (remote unix-socket (subpath $(sq "$tmp"))))"
+      dns=""
+      i=0
+      while (( i < ${#E_HOST[@]} )); do
+        if is_loopback "${E_HOST[i]}"; then echo "(allow network-outbound (remote ip \"localhost:${E_PORT[i]}\"))"
+        else echo "(allow network-outbound (remote ip \"*:${E_PORT[i]}\"))"; is_ip "${E_HOST[i]}" || dns=1; fi
+        i=$((i + 1))
+      done
+      # sandbox-exec can't name a remote host, so a remote server opens its port to any host,
+      # and a host name needs the system resolver
+      [[ -n $dns ]] && echo '(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))'
+    fi
+    echo '(deny file-write*)'
+    printf '(allow file-write* (subpath %s)' "$(sq "$tmp")"
+    [[ -n $natives_rw ]] && printf ' (subpath %s)' "$(sq "$natives")"
+    [[ $SAVE_SESSIONS == yes ]] && printf ' (subpath %s)' "$(sq "$(resolve "$STATE/sessions")")"
+    for d in $write_dirs; do printf ' (subpath %s)' "$(sq "$d")"; done
+    echo ' (literal "/dev/null") (literal "/dev/tty") (regex #"^/dev/ttys[0-9]+$") (regex #"^/dev/fd/"))'
+    echo "(deny file-read-data (subpath $(sq "$(resolve "$HOME")")))"
+    printf '(allow file-read-data (subpath %s) (subpath %s) (subpath %s)' "$(sq "$omp_dir")" "$(sq "$(resolve "$natives")")" "$(sq "$tmp")"
+    [[ $SAVE_SESSIONS == yes ]] && printf ' (subpath %s)' "$(sq "$(resolve "$STATE/sessions")")"
+    for d in $read_dirs $write_dirs $start_dir; do printf ' (subpath %s)' "$(sq "$d")"; done
+    echo ')'
+  } > "$tmp/sandbox.sb"
+  mkdir -p "$tmp/tmp"   # macOS's $TMPDIR is outside the jail's writable folders
+  envs=(HOME="$tmp/home" TMPDIR="$tmp/tmp" PATH="/usr/local/bin:/usr/bin:/bin" PI_NATIVES_DIR="$natives" USER="${USER:-$(id -un)}"
+        XDG_CONFIG_HOME="$tmp/home/.config" XDG_DATA_HOME="$tmp/home/.local/share"
+        XDG_CACHE_HOME="$tmp/home/.cache" XDG_STATE_HOME="$tmp/home/.local/state")
+  for v in TERM COLORTERM TERM_PROGRAM LANG LC_ALL LC_CTYPE TZ; do
+    [[ -n ${!v:-} ]] && envs+=("$v=${!v}")
+  done
+  jail() { (cd "$cwd" && exec /usr/bin/sandbox-exec -f "$tmp/sandbox.sb" /usr/bin/env -i "${envs[@]}" "$@"); }
+fi
+
+if [[ $mode == check ]]; then
+  probe > "$tmp/probe.sh"
+  # something in your home that the jail should not see: a top-level entry none of the
+  # opened folders sit in
+  opened=""
+  for d in "$omp_dir" "$natives" "$STATE" $read_dirs $write_dirs $start_dir; do
+    case $d in "$HOME"/*) d=${d#"$HOME"/}; opened="$opened ${d%%/*} " ;; esac
+  done
+  sample=""
+  for e in $(ls -A "$HOME" 2>/dev/null); do
+    [[ -e $HOME/$e ]] || continue   # a name with a space got split
+    case $opened in *" $e "*) ;; *) sample=$e; break ;; esac
+  done
+  in_addr=""; port=""
+  if (( model_ep >= 0 )); then
+    if [[ $OS == Linux && $ALLOW_NET != all ]]; then in_addr=${E_IN[0]} port=${E_INPORT[0]}
+    else in_addr=${E_HOST[0]} port=${E_PORT[0]}; fi
+  fi
+  log "checking the jail$( (( sel >= 0 )) && echo " for ${M_LABEL[sel]}")"
+  jail /bin/bash "$tmp/probe.sh" "$HOME" "$sample" "$in_addr" "$port"
+  rc=$?
+  (( rc == 0 )) && log "the jail holds" || log "FAILED: the jail does not hold (see FAIL lines)"
+  exit "$rc"
+fi
+
+log "opening ${M_LABEL[sel]} in omp, jailed"
+holes | sed 's/^/  /' >&2
+jail "$omp_bin" "${omp_args[@]}"
+rc=$?
+log "omp exited ($rc)"
+exit "$rc"
