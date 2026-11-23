@@ -17,7 +17,8 @@ base=/tmp; [[ $(uname -s) == Linux ]] && base=${XDG_RUNTIME_DIR:-/tmp}
 t=$(mktemp -d "$base/uncensored-test.XXXXXX") || exit 1
 t=$(cd "$t" && pwd -P)
 srv=""
-cleanup() { [[ -n $srv ]] && kill "$srv" 2>/dev/null; rm -rf -- "$t"; }
+# the wait reaps the server quietly; without it bash 3.2 prints "Terminated: 15" for it
+cleanup() { [[ -n $srv ]] && { kill "$srv" 2>/dev/null; wait "$srv" 2>/dev/null; }; rm -rf -- "$t"; }
 trap cleanup EXIT
 bad=0
 # macOS has no timeout(1); without it a hung run just isn't cut off
