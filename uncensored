@@ -235,8 +235,20 @@ fi
 tmp="" relay_pids=""
 after_cmd=""; (( sel >= 0 )) && [[ $mode == run ]] && after_cmd=${M_AFTER[sel]}
 cleanup() {
-  local p
+  local p pids
   for p in $relay_pids; do pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; done   # socat forks per connection
+  # macOS has no PID namespace to end the jail with omp, and omp leaves its daemon running; on
+  # its way out it writes into the throwaway home. So end whatever still has files open in
+  # there, and wait for it, before deleting it.
+  if [[ $OS == Darwin && -n $tmp && -d $tmp ]]; then
+    pids=$(/usr/sbin/lsof -t +D "$tmp" 2>/dev/null)
+    # shellcheck disable=SC2086
+    if [[ -n $pids ]]; then
+      kill $pids 2>/dev/null
+      for _ in $(seq 1 50); do kill -0 $pids 2>/dev/null || break; sleep 0.1; done
+      kill -9 $pids 2>/dev/null
+    fi
+  fi
   [[ -n $tmp && -d $tmp ]] && rm -rf -- "$tmp"
   if [[ -n $after_cmd ]]; then
     log "running: $after_cmd"
@@ -302,7 +314,9 @@ probe() {
 real_home=$1 sample=$2 model_in=$3 model_port=$4 bad=0
 pass() { echo "PASS  $*"; }
 fail() { echo "FAIL  $*"; bad=1; }
-tcp() { (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null; }
+# fd 9, not 3: macOS's resolver keeps a guarded fd (3 here), and bash 3.2 moving the socket
+# onto it gets bash killed (EXC_GUARD), which would pass the DNS check even with DNS open
+tcp() { (exec 9<>"/dev/tcp/$1/$2") 2>/dev/null; }
 tcp 1.1.1.1 443 && fail "reached 1.1.1.1:443" || pass "no internet (1.1.1.1:443 unreachable)"
 tcp example.com 80 && fail "looked up and reached example.com" || pass "no DNS (example.com unreachable)"
 if [[ -n $sample ]]; then

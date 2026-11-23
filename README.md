@@ -69,7 +69,7 @@ The API key command, if you use one, runs outside the jail, so the jail never se
 
 ## Limits
 
-- Tested on Linux (Arch). The macOS side is written but hasn't been run on a Mac yet.
+- Tested on Linux (Arch) and macOS 27 (Apple silicon). On macOS, remote model servers and `ALLOW_NET` hosts haven't been tried yet.
 - Tested with omp 19.1.0. A later omp could add another way to load tools; `test/tools-test.sh` will show it.
 - On Linux, extra `ALLOW_NET` hosts need ports from 1024 up, because the jail can't listen below 1024. The model's own server can be on any port.
 - On macOS, sandbox-exec can't name a remote host, so a remote model server (or `ALLOW_NET` host) opens its port to every host. A server on localhost is exact. Apple marks sandbox-exec as deprecated.
